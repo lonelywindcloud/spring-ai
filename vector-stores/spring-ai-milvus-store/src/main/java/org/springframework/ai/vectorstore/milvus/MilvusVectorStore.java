@@ -1,5 +1,5 @@
 /*
- * Copyright 2023-2024 the original author or authors.
+ * Copyright 2023-2025 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -23,7 +23,6 @@ import java.util.Optional;
 import java.util.stream.Collectors;
 
 import com.alibaba.fastjson.JSONObject;
-import io.micrometer.observation.ObservationRegistry;
 import io.milvus.client.MilvusServiceClient;
 import io.milvus.common.clientenum.ConsistencyLevelEnum;
 import io.milvus.exception.ParamException;
@@ -55,20 +54,18 @@ import org.slf4j.LoggerFactory;
 
 import org.springframework.ai.document.Document;
 import org.springframework.ai.document.DocumentMetadata;
-import org.springframework.ai.embedding.BatchingStrategy;
 import org.springframework.ai.embedding.EmbeddingModel;
 import org.springframework.ai.embedding.EmbeddingOptionsBuilder;
-import org.springframework.ai.embedding.TokenCountBatchingStrategy;
 import org.springframework.ai.model.EmbeddingUtils;
 import org.springframework.ai.observation.conventions.VectorStoreProvider;
 import org.springframework.ai.observation.conventions.VectorStoreSimilarityMetric;
 import org.springframework.ai.vectorstore.AbstractVectorStoreBuilder;
 import org.springframework.ai.vectorstore.SearchRequest;
 import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.ai.vectorstore.filter.Filter;
 import org.springframework.ai.vectorstore.filter.FilterExpressionConverter;
 import org.springframework.ai.vectorstore.observation.AbstractObservationVectorStore;
 import org.springframework.ai.vectorstore.observation.VectorStoreObservationContext;
-import org.springframework.ai.vectorstore.observation.VectorStoreObservationConvention;
 import org.springframework.beans.factory.InitializingBean;
 import org.springframework.util.Assert;
 import org.springframework.util.StringUtils;
@@ -174,12 +171,7 @@ public class MilvusVectorStore extends AbstractObservationVectorStore implements
 
 	private final MilvusServiceClient milvusClient;
 
-	@Deprecated(forRemoval = true, since = "1.0.0-M5")
-	private final MilvusVectorStoreConfig config;
-
 	private final boolean initializeSchema;
-
-	private final BatchingStrategy batchingStrategy;
 
 	private final String databaseName;
 
@@ -203,36 +195,6 @@ public class MilvusVectorStore extends AbstractObservationVectorStore implements
 
 	private final String embeddingFieldName;
 
-	@Deprecated(forRemoval = true, since = "1.0.0-M5")
-	public MilvusVectorStore(MilvusServiceClient milvusClient, EmbeddingModel embeddingModel,
-			boolean initializeSchema) {
-		this(milvusClient, embeddingModel, MilvusVectorStoreConfig.defaultConfig(), initializeSchema,
-				new TokenCountBatchingStrategy());
-	}
-
-	@Deprecated(forRemoval = true, since = "1.0.0-M5")
-	public MilvusVectorStore(MilvusServiceClient milvusClient, EmbeddingModel embeddingModel, boolean initializeSchema,
-			BatchingStrategy batchingStrategy) {
-		this(milvusClient, embeddingModel, MilvusVectorStoreConfig.defaultConfig(), initializeSchema, batchingStrategy);
-	}
-
-	@Deprecated(forRemoval = true, since = "1.0.0-M5")
-	public MilvusVectorStore(MilvusServiceClient milvusClient, EmbeddingModel embeddingModel,
-			MilvusVectorStoreConfig config, boolean initializeSchema, BatchingStrategy batchingStrategy) {
-		this(milvusClient, embeddingModel, config, initializeSchema, batchingStrategy, ObservationRegistry.NOOP, null);
-	}
-
-	@Deprecated(forRemoval = true, since = "1.0.0-M5")
-	public MilvusVectorStore(MilvusServiceClient milvusClient, EmbeddingModel embeddingModel,
-			MilvusVectorStoreConfig config, boolean initializeSchema, BatchingStrategy batchingStrategy,
-			ObservationRegistry observationRegistry, VectorStoreObservationConvention customObservationConvention) {
-
-		this(builder(milvusClient, embeddingModel).observationRegistry(observationRegistry)
-			.customObservationConvention(customObservationConvention)
-			.initializeSchema(initializeSchema)
-			.batchingStrategy(batchingStrategy));
-	}
-
 	/**
 	 * @param builder {@link VectorStore.Builder} for chroma vector store
 	 */
@@ -242,9 +204,7 @@ public class MilvusVectorStore extends AbstractObservationVectorStore implements
 		Assert.notNull(builder.milvusClient, "milvusClient must not be null");
 
 		this.milvusClient = builder.milvusClient;
-		this.batchingStrategy = builder.batchingStrategy;
 		this.initializeSchema = builder.initializeSchema;
-		this.config = null;
 		this.databaseName = builder.databaseName;
 		this.collectionName = builder.collectionName;
 		this.embeddingDimension = builder.embeddingDimension;
@@ -312,7 +272,7 @@ public class MilvusVectorStore extends AbstractObservationVectorStore implements
 	}
 
 	@Override
-	public Optional<Boolean> doDelete(List<String> idList) {
+	public void doDelete(List<String> idList) {
 		Assert.notNull(idList, "Document id list must not be null");
 
 		String deleteExpression = String.format("%s in [%s]", this.idFieldName,
@@ -328,8 +288,32 @@ public class MilvusVectorStore extends AbstractObservationVectorStore implements
 		if (deleteCount != idList.size()) {
 			logger.warn(String.format("Deleted only %s entries from requested %s ", deleteCount, idList.size()));
 		}
+	}
 
-		return Optional.of(status.getStatus() == Status.Success.getCode());
+	@Override
+	protected void doDelete(Filter.Expression filterExpression) {
+		Assert.notNull(filterExpression, "Filter expression must not be null");
+
+		try {
+			String nativeFilterExpression = this.filterExpressionConverter.convertExpression(filterExpression);
+
+			R<MutationResult> status = this.milvusClient.delete(DeleteParam.newBuilder()
+				.withDatabaseName(this.databaseName)
+				.withCollectionName(this.collectionName)
+				.withExpr(nativeFilterExpression)
+				.build());
+
+			if (status.getStatus() != Status.Success.getCode()) {
+				throw new IllegalStateException("Failed to delete documents by filter: " + status.getMessage());
+			}
+
+			long deleteCount = status.getData().getDeleteCnt();
+			logger.debug("Deleted {} documents matching filter expression", deleteCount);
+		}
+		catch (Exception e) {
+			logger.error("Failed to delete documents by filter: {}", e.getMessage(), e);
+			throw new IllegalStateException("Failed to delete documents by filter", e);
+		}
 	}
 
 	@Override
@@ -572,7 +556,14 @@ public class MilvusVectorStore extends AbstractObservationVectorStore implements
 		return SIMILARITY_TYPE_MAPPING.get(this.metricType).value();
 	}
 
-	public static final class Builder extends AbstractVectorStoreBuilder<Builder> {
+	@Override
+	public <T> Optional<T> getNativeClient() {
+		@SuppressWarnings("unchecked")
+		T client = (T) this.milvusClient;
+		return Optional.of(client);
+	}
+
+	public static class Builder extends AbstractVectorStoreBuilder<Builder> {
 
 		private final MilvusServiceClient milvusClient;
 
@@ -599,8 +590,6 @@ public class MilvusVectorStore extends AbstractObservationVectorStore implements
 		private String embeddingFieldName = EMBEDDING_FIELD_NAME;
 
 		private boolean initializeSchema = false;
-
-		private BatchingStrategy batchingStrategy = new TokenCountBatchingStrategy();
 
 		/**
 		 * @param milvusClient the Milvus service client to use for database operations
@@ -750,18 +739,6 @@ public class MilvusVectorStore extends AbstractObservationVectorStore implements
 		}
 
 		/**
-		 * Configures the strategy for batching operations.
-		 * @param batchingStrategy the batching strategy to use for grouping operations
-		 * @return this builder instance
-		 * @throws IllegalArgumentException if batchingStrategy is null
-		 */
-		public Builder batchingStrategy(BatchingStrategy batchingStrategy) {
-			Assert.notNull(batchingStrategy, "batchingStrategy must not be null");
-			this.batchingStrategy = batchingStrategy;
-			return this;
-		}
-
-		/**
 		 * Builds and returns a new MilvusVectorStore instance with the configured
 		 * settings.
 		 * @return a new MilvusVectorStore instance
@@ -769,226 +746,6 @@ public class MilvusVectorStore extends AbstractObservationVectorStore implements
 		 */
 		public MilvusVectorStore build() {
 			return new MilvusVectorStore(this);
-		}
-
-	}
-
-	@Deprecated(forRemoval = true, since = "1.0.0-M5")
-	public static final class MilvusVectorStoreConfig {
-
-		private final String databaseName;
-
-		private final String collectionName;
-
-		private final int embeddingDimension;
-
-		private final IndexType indexType;
-
-		private final MetricType metricType;
-
-		private final String indexParameters;
-
-		private final String idFieldName;
-
-		private final boolean isAutoId;
-
-		private final String contentFieldName;
-
-		private final String metadataFieldName;
-
-		private final String embeddingFieldName;
-
-		private MilvusVectorStoreConfig(Builder builder) {
-			this.databaseName = builder.databaseName;
-			this.collectionName = builder.collectionName;
-			this.embeddingDimension = builder.embeddingDimension;
-			this.indexType = builder.indexType;
-			this.metricType = builder.metricType;
-			this.indexParameters = builder.indexParameters;
-			this.idFieldName = builder.idFieldName;
-			this.isAutoId = builder.isAutoId;
-			this.contentFieldName = builder.contentFieldName;
-			this.metadataFieldName = builder.metadataFieldName;
-			this.embeddingFieldName = builder.embeddingFieldName;
-		}
-
-		/**
-		 * Start building a new configuration.
-		 * @return The entry point for creating a new configuration.
-		 */
-		public static Builder builder() {
-			return new Builder();
-		}
-
-		/**
-		 * {@return the default config}
-		 */
-		public static MilvusVectorStoreConfig defaultConfig() {
-			return builder().build();
-		}
-
-		@Deprecated(forRemoval = true, since = "1.0.0-M5")
-		public static final class Builder {
-
-			private String databaseName = DEFAULT_DATABASE_NAME;
-
-			private String collectionName = DEFAULT_COLLECTION_NAME;
-
-			private int embeddingDimension = INVALID_EMBEDDING_DIMENSION;
-
-			private IndexType indexType = IndexType.IVF_FLAT;
-
-			private MetricType metricType = MetricType.COSINE;
-
-			private String indexParameters = "{\"nlist\":1024}";
-
-			private String idFieldName = DOC_ID_FIELD_NAME;
-
-			private boolean isAutoId = false;
-
-			private String contentFieldName = CONTENT_FIELD_NAME;
-
-			private String metadataFieldName = METADATA_FIELD_NAME;
-
-			private String embeddingFieldName = EMBEDDING_FIELD_NAME;
-
-			private Builder() {
-			}
-
-			/**
-			 * Configures the Milvus metric type to use. Leave {@literal null} or blank to
-			 * use the metric metric: https://milvus.io/docs/metric.md#floating
-			 * @param metricType the metric type to use
-			 * @return this builder
-			 */
-			public Builder withMetricType(MetricType metricType) {
-				Assert.notNull(metricType, "Collection Name must not be empty");
-				Assert.isTrue(
-						metricType == MetricType.IP || metricType == MetricType.L2 || metricType == MetricType.COSINE,
-						"Only the text metric types IP and L2 are supported");
-
-				this.metricType = metricType;
-				return this;
-			}
-
-			/**
-			 * Configures the Milvus index type to use. Leave {@literal null} or blank to
-			 * use the default index.
-			 * @param indexType the index type to use
-			 * @return this builder
-			 */
-			public Builder withIndexType(IndexType indexType) {
-				this.indexType = indexType;
-				return this;
-			}
-
-			/**
-			 * Configures the Milvus index parameters to use. Leave {@literal null} or
-			 * blank to use the default index parameters.
-			 * @param indexParameters the index parameters to use
-			 * @return this builder
-			 */
-			public Builder withIndexParameters(String indexParameters) {
-				this.indexParameters = indexParameters;
-				return this;
-			}
-
-			/**
-			 * Configures the Milvus database name to use. Leave {@literal null} or blank
-			 * to use the default database.
-			 * @param databaseName the database name to use
-			 * @return this builder
-			 */
-			public Builder withDatabaseName(String databaseName) {
-				this.databaseName = databaseName;
-				return this;
-			}
-
-			/**
-			 * Configures the Milvus collection name to use. Leave {@literal null} or
-			 * blank to use the default collection name.
-			 * @param collectionName the collection name to use
-			 * @return this builder
-			 */
-			public Builder withCollectionName(String collectionName) {
-				this.collectionName = collectionName;
-				return this;
-			}
-
-			/**
-			 * Configures the size of the embedding. Defaults to {@literal 1536}, inline
-			 * with OpenAIs embeddings.
-			 * @param newEmbeddingDimension The dimension of the embedding
-			 * @return this builder
-			 */
-			public Builder withEmbeddingDimension(int newEmbeddingDimension) {
-
-				Assert.isTrue(newEmbeddingDimension >= 1 && newEmbeddingDimension <= 32768,
-						"Dimension has to be withing the boundaries 1 and 32768 (inclusively)");
-
-				this.embeddingDimension = newEmbeddingDimension;
-				return this;
-			}
-
-			/**
-			 * Configures the ID field name. Default is {@value #DOC_ID_FIELD_NAME}.
-			 * @param idFieldName The name for the ID field
-			 * @return this builder
-			 */
-			public Builder withIDFieldName(String idFieldName) {
-				this.idFieldName = idFieldName;
-				return this;
-			}
-
-			/**
-			 * Configures the boolean flag if the auto-id is used. Default is false.
-			 * @param isAutoId boolean flag to indicate if the auto-id is enabled
-			 * @return this builder
-			 */
-			public Builder withAutoId(boolean isAutoId) {
-				this.isAutoId = isAutoId;
-				return this;
-			}
-
-			/**
-			 * Configures the content field name. Default is {@value #CONTENT_FIELD_NAME}.
-			 * @param contentFieldName The name for the content field
-			 * @return this builder
-			 */
-			public Builder withContentFieldName(String contentFieldName) {
-				this.contentFieldName = contentFieldName;
-				return this;
-			}
-
-			/**
-			 * Configures the metadata field name. Default is
-			 * {@value #METADATA_FIELD_NAME}.
-			 * @param metadataFieldName The name for the metadata field
-			 * @return this builder
-			 */
-			public Builder withMetadataFieldName(String metadataFieldName) {
-				this.metadataFieldName = metadataFieldName;
-				return this;
-			}
-
-			/**
-			 * Configures the embedding field name. Default is
-			 * {@value #EMBEDDING_FIELD_NAME}.
-			 * @param embeddingFieldName The name for the embedding field
-			 * @return this builder
-			 */
-			public Builder withEmbeddingFieldName(String embeddingFieldName) {
-				this.embeddingFieldName = embeddingFieldName;
-				return this;
-			}
-
-			/**
-			 * {@return the immutable configuration}
-			 */
-			public MilvusVectorStoreConfig build() {
-				return new MilvusVectorStoreConfig(this);
-			}
-
 		}
 
 	}
